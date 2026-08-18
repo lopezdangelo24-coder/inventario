@@ -29,9 +29,7 @@ interface InventoryContextValue {
   products: Product[]
   movements: Movement[]
   ready: boolean
-  /** Todas las variantes (marcas) que comparten un SKU dado. */
   findBySku: (sku: string) => Product[]
-  /** Coincidencia por SKU o código de barras (para el escáner). */
   findByCode: (code: string) => Product[]
   getById: (id: number) => Product | undefined
   addProduct: (draft: ProductDraft) => Product
@@ -44,7 +42,7 @@ interface InventoryContextValue {
 
 const InventoryContext = createContext<InventoryContextValue | null>(null)
 
-function loadProducts(): PersistShape {
+function loadLocalProducts(): PersistShape {
   if (typeof window === 'undefined') {
     return { products: INITIAL_PRODUCTS, seq: INITIAL_PRODUCTS.length }
   }
@@ -78,18 +76,40 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
   const seqRef = useRef(0)
   const movSeqRef = useRef(0)
 
-  // Hidratación desde localStorage.
+  // Carga inicial desde Neon DB (con fallback a localStorage)
   useEffect(() => {
-    const loaded = loadProducts()
-    setProducts(loaded.products)
-    seqRef.current = Math.max(loaded.seq, ...loaded.products.map((p) => p.id), 0)
-    const movs = loadMovements()
-    setMovements(movs)
-    movSeqRef.current = Math.max(0, ...movs.map((m) => m.id))
-    setReady(true)
+    async function init() {
+      try {
+        const res = await fetch('/api/productos')
+        if (res.ok) {
+          const dbProducts = await res.json()
+          if (Array.isArray(dbProducts) && dbProducts.length > 0) {
+            setProducts(dbProducts)
+            seqRef.current = Math.max(0, ...dbProducts.map((p: Product) => p.id))
+          } else {
+            const loaded = loadLocalProducts()
+            setProducts(loaded.products)
+            seqRef.current = Math.max(loaded.seq, ...loaded.products.map((p) => p.id), 0)
+          }
+        } else {
+          throw new Error('Fallback')
+        }
+      } catch {
+        const loaded = loadLocalProducts()
+        setProducts(loaded.products)
+        seqRef.current = Math.max(loaded.seq, ...loaded.products.map((p) => p.id), 0)
+      }
+
+      const movs = loadMovements()
+      setMovements(movs)
+      movSeqRef.current = Math.max(0, ...movs.map((m) => m.id))
+      setReady(true)
+    }
+
+    init()
   }, [])
 
-  // Persistencia.
+  // Persistencia local secundaria
   useEffect(() => {
     if (!ready) return
     window.localStorage.setItem(
@@ -115,7 +135,7 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     (code: string) => {
       const norm = code.trim().toLowerCase()
       if (!norm) return []
-      const byBarcode = products.filter((p) => p.barcode.toLowerCase() === norm)
+      const byBarcode = products.filter((p) => p.barcode?.toLowerCase() === norm)
       if (byBarcode.length) return byBarcode
       return products.filter((p) => p.sku.toLowerCase() === norm)
     },
@@ -128,14 +148,38 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
   )
 
   const addProduct = useCallback((draft: ProductDraft) => {
-    const id = ++seqRef.current
-    const product: Product = { id, ...draft }
-    setProducts((prev) => [product, ...prev])
-    return product
+    const tempId = ++seqRef.current
+    const newProduct: Product = { id: tempId, ...draft }
+    
+    setProducts((prev) => [newProduct, ...prev])
+
+    // Sincronizar en Neon DB
+    fetch('/api/productos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(draft),
+    })
+      .then((res) => res.json())
+      .then((createdProduct) => {
+        if (createdProduct && createdProduct.id) {
+          setProducts((prev) =>
+            prev.map((p) => (p.id === tempId ? { ...p, id: createdProduct.id } : p)),
+          )
+        }
+      })
+      .catch((err) => console.error('Error guardando en Neon:', err))
+
+    return newProduct
   }, [])
 
   const updateProduct = useCallback((id: number, draft: ProductDraft) => {
     setProducts((prev) => prev.map((p) => (p.id === id ? { ...p, ...draft, id } : p)))
+
+    fetch('/api/productos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, ...draft }),
+    }).catch((err) => console.error('Error actualizando en Neon:', err))
   }, [])
 
   const deleteProduct = useCallback((id: number) => {
@@ -163,6 +207,14 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
             note,
           }
           setMovements((m) => [movement, ...m])
+
+          // Sincronizar actualización de stock en Neon DB
+          fetch('/api/productos', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ...p, currentStock: nextStock }),
+          }).catch((err) => console.error('Error actualizando stock en Neon:', err))
+
           return { ...p, currentStock: nextStock }
         }),
       )
@@ -176,12 +228,11 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
     setProducts((prev) => {
       const next = [...prev]
       for (const draft of drafts) {
-        // Coincidencia por SKU + Marca (clave lógica) o por código de barras.
         const idx = next.findIndex(
           (p) =>
             (p.sku.toLowerCase() === draft.sku.toLowerCase() &&
               p.brand.toLowerCase() === draft.brand.toLowerCase()) ||
-            (!!draft.barcode && p.barcode.toLowerCase() === draft.barcode.toLowerCase()),
+            (!!draft.barcode && p.barcode?.toLowerCase() === draft.barcode.toLowerCase()),
         )
         if (idx >= 0) {
           next[idx] = { ...next[idx], ...draft, id: next[idx].id }
@@ -190,6 +241,13 @@ export function InventoryProvider({ children }: { children: React.ReactNode }) {
           next.unshift({ id: ++seqRef.current, ...draft })
           added++
         }
+
+        // Sincronizar cada uno con la base de datos de Neon
+        fetch('/api/productos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(draft),
+        }).catch((err) => console.error('Error importando a Neon:', err))
       }
       return next
     })
